@@ -1,2 +1,1 @@
-# tltp
-Two-Level Tensor Parallelism
+# TLTP: Two-Level Tensor Parallelism
