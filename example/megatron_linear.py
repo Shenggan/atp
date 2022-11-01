@@ -1,22 +1,18 @@
-import os
-
 import torch
 import torch.distributed as dist
-from spmd import DeviceMesh
 
 from tltp.layer import ColumnLinear, RowLinear
+import tltp.distributed as tltp_dist
 
 
 def main():
     dist.init_process_group("nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-
-    rank, world_size = dist.get_rank(), dist.get_world_size()
-    print(f"DIST INFO: {rank} {world_size}")
-
     # NOTE: still use 2d device mesh for megatron-style TP
-    mesh = DeviceMesh("cuda", [[0, 1, 2, 3]])
+    tltp_dist.init_mesh([1, 2])
+
+    rank = dist.get_rank()    
+
+    mesh = tltp_dist.get_default_mesh()
 
     tl_linear_1 = ColumnLinear(64, 64 * 4, mesh).cuda()
     tl_linear_2 = RowLinear(64 * 4, 64, mesh, input_is_shard=True).cuda()
@@ -25,11 +21,15 @@ def main():
 
     grad_output = torch.randn_like(output_).cuda()
 
-    print(output_.shape)
+    print(f"[{rank}] output_.shape: {output_.shape}")
 
     output_.backward(grad_output)
 
-    print(input_.grad.shape)
+    print(f"[{rank}] input_.grad.shape: {input_.grad.shape}")
+
+    dist.all_reduce(input_.grad)
+
+    print(f"[{rank}] input_.grad.shape: {input_.grad.shape}")
 
 
 if __name__ == '__main__':

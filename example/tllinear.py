@@ -1,46 +1,33 @@
-import os
-
 import torch
 import torch.distributed as dist
-from spmd import DeviceMesh, Shard
+from spmd import Shard
 
 from tltp.layer import TLLinear
+import tltp.distributed as tltp_dist
 
 
 def main():
-
     dist.init_process_group("nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    tltp_dist.init_mesh((2, 2))
+    mesh = tltp_dist.get_default_mesh()
 
-    rank, world_size = dist.get_rank(), dist.get_world_size()
-    print(f"DIST INFO: {rank} {world_size}")
+    shard_strategy_1 = [Shard(1), Shard(0)]
 
-    # can group into small mesh (e.g. we can construct mesh for each node)
-    # if rank in [0,1]:
-    #     mesh = DeviceMesh("cuda", [[0, 1]])
-    # else:
-    #     mesh = DeviceMesh("cuda", [[2, 3]])
+    shard_strategy_2 = [Shard(0), Shard(1)]
 
-    mesh = DeviceMesh("cuda", [[0, 1], [2, 3]])
-
-    shard_strategy = [Shard(1), Shard(0)]
-
-    shard_strategy = [Shard(0), Shard(1)]
-
-    tl_linear_1 = TLLinear(64, 64 * 4, mesh, shard_strategy, input_is_shard=False).cuda()
-    tl_linear_2 = TLLinear(64 * 4, 64, mesh, shard_strategy, input_is_shard=True).cuda()
+    tl_linear_1 = TLLinear(64, 64 * 4, mesh, shard_strategy_1, input_is_shard=False).cuda()
+    tl_linear_2 = TLLinear(64 * 4, 64, mesh, shard_strategy_2, input_is_shard=True).cuda()
 
     input_ = torch.randn(2, 1024, 64).cuda().requires_grad_(True)
     output_ = tl_linear_2(tl_linear_1(input_))
 
     grad_output = torch.randn_like(output_).cuda()
 
-    print(output_.shape)
+    print(f"output_.shape: {output_.shape}")
 
     output_.backward(grad_output)
 
-    print(input_.grad.shape)
+    print(f"input_.grad.shape: {input_.grad.shape}")
 
 
 if __name__ == '__main__':

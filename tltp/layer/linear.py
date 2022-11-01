@@ -2,6 +2,7 @@ from typing import List
 
 import torch
 from torch.nn.parameter import Parameter
+import torch.distributed as dist
 
 from spmd import DeviceMesh, Shard
 from spmd.tensor.placement_types import Placement
@@ -27,7 +28,8 @@ class TLLinearFunc(torch.autograd.Function):
 
         output = output.view(*(input.size()[:-1]), -1)
 
-        mesh.all_reduce(output, mesh_dim=forward_allreduce_mesh_dim)
+        torch.distributed.all_reduce(output, dist.ReduceOp.SUM,
+                                     mesh.get_dim_groups()[forward_allreduce_mesh_dim])
 
         if ctx.use_bias:
             output += bias
@@ -44,13 +46,20 @@ class TLLinearFunc(torch.autograd.Function):
         grad_output = grad_output.view(-1, grad_output.size()[-1])
         input_2d = input.view(-1, input.size()[-1])
 
+        # async allreduce for grad_input
         grad_input = torch.ops.aten.mm(grad_output, weight)
-        mesh.all_reduce(grad_input, mesh_dim=backward_allreduce_mesh_dim)
-        grad_weight = torch.ops.aten.mm(grad_output.t(), input_2d)
+        handle = torch.distributed.all_reduce(grad_input,
+                                              dist.ReduceOp.SUM,
+                                              mesh.get_dim_groups()[backward_allreduce_mesh_dim],
+                                              async_op=True)
 
+        grad_weight = torch.ops.aten.mm(grad_output.t(), input_2d)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
+        # sync grad_input here
+        handle.wait()
         grad_input = grad_input.view(*(input.size()))
+
         return grad_input, grad_weight, grad_bias, None, None, None
 
 
@@ -74,6 +83,7 @@ class TLLinear(torch.nn.Module):
                  shard_strategy: List[Placement],
                  input_is_shard: bool = False,
                  shard_activation: bool = False,
+                 skip_bias_add: bool = False,
                  params_dtype=torch.float32) -> None:
         super().__init__()
         self.input_size = input_size
@@ -83,13 +93,15 @@ class TLLinear(torch.nn.Module):
         self.shard_strategy = shard_strategy
         self.params_dtype = params_dtype
 
-        print(self.mesh, self.shard_strategy)
+        print(f"[{dist.get_rank()}]: {self.mesh}, {self.shard_strategy}")
 
         self.shard_input_size = self.input_size
         self.shard_output_size = self.output_size
 
         self.input_is_shard = input_is_shard
         self.shard_activation = shard_activation
+
+        self.skip_bias_add = skip_bias_add
 
         assert (len(self.shard_strategy) == self.mesh.ndim == 2)
         self.forward_allreduce_mesh_dim = None
@@ -121,10 +133,13 @@ class TLLinear(torch.nn.Module):
         self.linear_func = TLLinearFunc.apply
 
     def forward(self, input_):
+        bias = self.bias if not self.skip_bias_add else None
+
         if not self.input_is_shard:
             input_ = shard_to_tp_region(input_, self.mesh, self.shard_strategy)
-        return self.linear_func(input_, self.weight, self.bias, self.mesh,
-                                self.forward_allreduce_mesh_dim, self.backward_allreduce_mesh_dim)
+        output = self.linear_func(input_, self.weight, bias, self.mesh,
+                                  self.forward_allreduce_mesh_dim, self.backward_allreduce_mesh_dim)
+        return output
 
 
 class ColumnLinear(TLLinear):
