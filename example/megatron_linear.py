@@ -11,7 +11,6 @@ def main():
     tltp_dist.init_mesh([1, 2])
 
     rank = dist.get_rank()
-
     mesh = tltp_dist.get_default_mesh()
 
     tl_linear_1 = ColumnLinear(64, 64 * 4, mesh, seq_shard=True).cuda()

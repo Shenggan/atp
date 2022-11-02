@@ -7,7 +7,7 @@ import torch.distributed as dist
 from spmd import DeviceMesh, Shard
 from spmd.tensor.placement_types import Placement
 
-from .mapping import shard_to_tp_region
+from .mapping import shard_to_tp_region, gather_tensor, reduce_scatter_tensor
 from .utils import delay_kernel
 
 
@@ -30,14 +30,7 @@ class TLLinearFunc(torch.autograd.Function):
         if ctx.input_seq_shard:
             gather_mesh_dim = 1 - forward_allreduce_mesh_dim
             gather_group = mesh.get_dim_groups()[gather_mesh_dim]
-            gathered_tensor_size = list(input.size())
-            gathered_tensor_size[ctx.seq_dim] *= gather_group.size()
-            gathered_tensor = torch.empty(*gathered_tensor_size,
-                                          dtype=input.dtype,
-                                          device=input.device)
-            torch.distributed.all_gather_into_tensor(gathered_tensor, input, gather_group)
-
-            input = gathered_tensor
+            input = gather_tensor(input, tensor_dim=ctx.seq_dim, group=gather_group)
 
         # convert the tensor shapes to 2D for aten ops
         input_2d = input.view(-1, input.size()[-1])
@@ -48,18 +41,9 @@ class TLLinearFunc(torch.autograd.Function):
         # if ctx.output_seq_shard, use reduce_scatter instead of allreduce
         reduce_group = mesh.get_dim_groups()[forward_allreduce_mesh_dim]
         if ctx.output_seq_shard:
-            reduce_scatter_size = list(output.size())
-            reduce_scatter_size[ctx.seq_dim] //= reduce_group.size()
-            reduce_scatter_output = torch.empty(*reduce_scatter_size,
-                                                device=output.device,
-                                                dtype=output.dtype)
-            torch.distributed.reduce_scatter_tensor(reduce_scatter_output,
-                                                    output,
-                                                    op=dist.ReduceOp.SUM,
-                                                    group=reduce_group)
-            output = reduce_scatter_output
+            output = reduce_scatter_tensor(output, tensor_dim=ctx.seq_dim, group=reduce_group)
         else:
-            torch.distributed.all_reduce(output, op=dist.ReduceOp.SUM, group=reduce_group)
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=reduce_group)
 
         if ctx.use_bias:
             output += bias
@@ -79,27 +63,13 @@ class TLLinearFunc(torch.autograd.Function):
         if ctx.input_seq_shard:
             gather_mesh_dim = backward_allreduce_mesh_dim
             gather_group = mesh.get_dim_groups()[gather_mesh_dim]
-            gathered_tensor_size = list(input.size())
-            gathered_tensor_size[ctx.seq_dim] *= gather_group.size()
-            gathered_tensor = torch.empty(*gathered_tensor_size,
-                                          dtype=input.dtype,
-                                          device=input.device)
-            torch.distributed.all_gather_into_tensor(gathered_tensor, input, gather_group)
-
-            input = gathered_tensor
+            input = gather_tensor(input, tensor_dim=ctx.seq_dim, group=gather_group)
 
         # if ctx.output_seq_shard, allgather here
         if ctx.output_seq_shard:
             gather_mesh_dim = 1 - backward_allreduce_mesh_dim
             gather_group = mesh.get_dim_groups()[gather_mesh_dim]
-            gathered_tensor_size = list(grad_output.size())
-            gathered_tensor_size[ctx.seq_dim] *= gather_group.size()
-            gathered_tensor = torch.empty(*gathered_tensor_size,
-                                          dtype=grad_output.dtype,
-                                          device=grad_output.device)
-            torch.distributed.all_gather_into_tensor(gathered_tensor, grad_output, gather_group)
-
-            grad_output = gathered_tensor
+            grad_output = gather_tensor(grad_output, tensor_dim=ctx.seq_dim, group=gather_group)
 
         grad_output = grad_output.view(-1, grad_output.size()[-1])
         input_2d = input.view(-1, input.size()[-1])
@@ -112,21 +82,12 @@ class TLLinearFunc(torch.autograd.Function):
         handle = None
         reduce_group = mesh.get_dim_groups()[backward_allreduce_mesh_dim]
         if ctx.input_seq_shard:
-            reduce_scatter_size = list(grad_input.size())
-            reduce_scatter_size[ctx.seq_dim] //= reduce_group.size()
-            reduce_scatter_output = torch.empty(*reduce_scatter_size,
-                                                device=grad_input.device,
-                                                dtype=grad_input.dtype)
-            handle = torch.distributed.reduce_scatter_tensor(reduce_scatter_output,
-                                                             grad_input,
-                                                             op=dist.ReduceOp.SUM,
-                                                             group=reduce_group)
-            grad_input = reduce_scatter_output
+            grad_input, handle = reduce_scatter_tensor(grad_input, tensor_dim=ctx.seq_dim, group=reduce_group, async_op=True)
         else:
-            handle = torch.distributed.all_reduce(grad_input,
-                                                  op=dist.ReduceOp.SUM,
-                                                  group=reduce_group,
-                                                  async_op=True)
+            handle = dist.all_reduce(grad_input,
+                                     op=dist.ReduceOp.SUM,
+                                     group=reduce_group,
+                                     async_op=True)
         delay_kernel(grad_output.device)
 
         grad_weight = torch.ops.aten.mm(grad_output.t(), input_2d)
@@ -257,7 +218,7 @@ class ColumnLinear(TLLinear):
                          shard_strategy,
                          input_is_shard=False,
                          input_seq_shard=seq_shard,
-                         output_seq_shard=(not seq_shard),
+                         output_seq_shard=False,
                          params_dtype=params_dtype)
 
 
@@ -297,6 +258,6 @@ class RowLinear(TLLinear):
                          module_mesh,
                          shard_strategy,
                          input_is_shard=input_is_shard,
-                         input_seq_shard=(not seq_shard),
+                         input_seq_shard=False,
                          output_seq_shard=seq_shard,
                          params_dtype=params_dtype)

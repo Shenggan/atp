@@ -1,6 +1,7 @@
 from typing import List
 
 import torch
+import torch.distributed as dist
 
 from spmd import DeviceMesh
 from spmd.tensor.placement_types import Placement
@@ -18,17 +19,49 @@ def _scatter_local_tensor(input_: torch.Tensor, mesh: DeviceMesh, mesh_dim: int)
     return output
 
 
-def gather_tensor(input_: torch.Tensor, mesh: DeviceMesh, mesh_dim: int):
-    world_size_dim = mesh.size(mesh_dim)
+def gather_tensor(input_: torch.Tensor, tensor_dim: int, group: dist.ProcessGroup, async_op=False):
+    world_size_dim = group.size()
     if world_size_dim == 1:
         return input_
+
+    if tensor_dim != 0:
+        input_ = input_.transpose(tensor_dim, 0).contiguous()
     input_size = list(input_.size())
-    input_size[-1] *= world_size_dim
+    input_size[0] *= world_size_dim
     gather_tensor = torch.empty(*input_size, dtype=input_.dtype, device=input_.device)
-    # (deprecated) mesh.all_gather_base
-    # mesh.all_gather_base(gather_tensor, input_, mesh_dim=mesh_dim, tensor_dim=-1)
-    torch.distributed.all_gather_into_tensor(gather_tensor, input_, mesh.get_dim_groups()[mesh_dim])
+    handle = dist.all_gather_into_tensor(gather_tensor, input_, group=group, async_op=async_op)
+
+    if tensor_dim != 0:
+        gather_tensor = gather_tensor.transpose(tensor_dim, 0).contiguous()
+
+    if async_op:
+        return gather_tensor, handle
+
     return gather_tensor
+
+
+def reduce_scatter_tensor(input_: torch.Tensor,
+                          tensor_dim: int,
+                          group: dist.ProcessGroup,
+                          async_op=False):
+    world_size_dim = group.size()
+    if world_size_dim == 1:
+        return input_
+
+    if tensor_dim != 0:
+        input_ = input_.transpose(tensor_dim, 0).contiguous()
+    input_size = list(input_.size())
+    input_size[0] //= world_size_dim
+    scatter_tensor = torch.empty(*input_size, dtype=input_.dtype, device=input_.device)
+    handle = dist.reduce_scatter_tensor(scatter_tensor, input_, group=group, async_op=async_op)
+
+    if tensor_dim != 0:
+        scatter_tensor = scatter_tensor.transpose(tensor_dim, 0).contiguous()
+
+    if async_op:
+        return scatter_tensor, handle
+
+    return scatter_tensor
 
 
 class _ShardToTPRegion(torch.autograd.Function):
@@ -50,7 +83,7 @@ class _ShardToTPRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return gather_tensor(grad_output, ctx.mesh, ctx.mesh_dim), None, None
+        return gather_tensor(grad_output, -1, ctx.mesh.get_dim_groups()[ctx.mesh_dim]), None, None
 
 
 shard_to_tp_region = _ShardToTPRegion.apply
