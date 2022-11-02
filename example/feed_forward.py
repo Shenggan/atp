@@ -24,8 +24,8 @@ def feedforward_aten_func(weight_1_, bias_1_, weight_2_, bias_2_, input_):
 
 def feedforward_aten_1d_func(weight_1_, bias_1_, weight_2_, bias_2_, input_, mesh):
 
-    output_size = (input_.size(0) * mesh.size() // 8, input_.size(1))
-    gathered_tensor = torch.empty(*output_size, dtype=input_.dtype, device=input_.device)
+    output_size = (input_.size(0) * mesh.size(), input_.size(1))
+    gathered_tensor = torch.empty(*output_size, dtype=input_.dtype, device=input_.device).chunk(8)
 
     addmm_o_1 = torch.empty(input_.size(0) * mesh.size(),
                             weight_1_.size(1),
@@ -34,11 +34,21 @@ def feedforward_aten_1d_func(weight_1_, bias_1_, weight_2_, bias_2_, input_, mes
 
     addmm_o_1_list = addmm_o_1.chunk(8)
 
+    handles = []
     for chunk_id, chunk_data in enumerate(input_.chunk(8)):
-        torch.distributed.all_gather_into_tensor(gathered_tensor,
-                                                 chunk_data,
-                                                 group=mesh.get_dim_groups()[0])
-        torch.ops.aten.addmm.out(bias_1_, gathered_tensor, weight_1_, out=addmm_o_1_list[chunk_id])
+        handles.append(
+            torch.distributed.all_gather_into_tensor(gathered_tensor[chunk_id],
+                                                     chunk_data,
+                                                     group=mesh.get_dim_groups()[0],
+                                                     async_op=True))
+
+    for handle in handles:
+        handle.wait()
+        torch.ops.aten.addmm.out(bias_1_,
+                                 gathered_tensor[chunk_id],
+                                 weight_1_,
+                                 out=addmm_o_1_list[chunk_id])
+
     gelu_o = torch.ops.aten.gelu(addmm_o_1)
 
     reduce_scatter_size = (gelu_o.size(0) // 2, weight_2_.size(1))
