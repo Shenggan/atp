@@ -32,3 +32,8 @@ def split_tensor_along_last_dim(tensor, num_partitions,
         return tuple(chunk.contiguous() for chunk in tensor_list)
 
     return tensor_list
+
+def delay_kernel(device):
+    # Delay the start of weight gradient computation shortly (3us) to have
+    # reduce scatter scheduled first and have GPU resources allocated
+    _ = torch.empty(1, device=device) + 1

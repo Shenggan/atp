@@ -8,19 +8,36 @@ from spmd import DeviceMesh, Shard
 from spmd.tensor.placement_types import Placement
 
 from .mapping import shard_to_tp_region
+from .utils import delay_kernel
 
 
 class TLLinearFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
-                mesh: DeviceMesh, forward_allreduce_mesh_dim: int,
-                backward_allreduce_mesh_dim: int):
+                mesh: DeviceMesh, input_seq_shard: bool, output_seq_shard: bool,
+                forward_allreduce_mesh_dim: int, backward_allreduce_mesh_dim: int):
         ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
         ctx.input_shape = input.shape
         ctx.mesh = mesh
         ctx.backward_allreduce_mesh_dim = backward_allreduce_mesh_dim
+        ctx.input_seq_shard = input_seq_shard
+        ctx.output_seq_shard = output_seq_shard
+        ctx.seq_dim = 1
+
+        # all_gather input in sequence dim (replicate dim on mesh)
+        if ctx.input_seq_shard:
+            gather_mesh_dim = 1 - forward_allreduce_mesh_dim
+            gather_group = mesh.get_dim_groups()[gather_mesh_dim]
+            gathered_tensor_size = list(input.size())
+            gathered_tensor_size[ctx.seq_dim] *= gather_group.size()
+            gathered_tensor = torch.empty(*gathered_tensor_size,
+                                          dtype=input.dtype,
+                                          device=input.device)
+            torch.distributed.all_gather_into_tensor(gathered_tensor, input, gather_group)
+
+            input = gathered_tensor
 
         # convert the tensor shapes to 2D for aten ops
         input_2d = input.view(-1, input.size()[-1])
@@ -28,8 +45,21 @@ class TLLinearFunc(torch.autograd.Function):
 
         output = output.view(*(input.size()[:-1]), -1)
 
-        torch.distributed.all_reduce(output, dist.ReduceOp.SUM,
-                                     mesh.get_dim_groups()[forward_allreduce_mesh_dim])
+        # if ctx.output_seq_shard, use reduce_scatter instead of allreduce
+        reduce_group = mesh.get_dim_groups()[forward_allreduce_mesh_dim]
+        if ctx.output_seq_shard:
+            reduce_scatter_size = list(output.size())
+            reduce_scatter_size[ctx.seq_dim] //= reduce_group.size()
+            reduce_scatter_output = torch.empty(*reduce_scatter_size,
+                                                device=output.device,
+                                                dtype=output.dtype)
+            torch.distributed.reduce_scatter_tensor(reduce_scatter_output,
+                                                    output,
+                                                    op=dist.ReduceOp.SUM,
+                                                    group=reduce_group)
+            output = reduce_scatter_output
+        else:
+            torch.distributed.all_reduce(output, op=dist.ReduceOp.SUM, group=reduce_group)
 
         if ctx.use_bias:
             output += bias
@@ -43,24 +73,70 @@ class TLLinearFunc(torch.autograd.Function):
         mesh = ctx.mesh
         backward_allreduce_mesh_dim = ctx.backward_allreduce_mesh_dim
 
+        grad_output = grad_output.contiguous()
+
+        # all_gather input in sequence dim (replicate dim on mesh)
+        if ctx.input_seq_shard:
+            gather_mesh_dim = backward_allreduce_mesh_dim
+            gather_group = mesh.get_dim_groups()[gather_mesh_dim]
+            gathered_tensor_size = list(input.size())
+            gathered_tensor_size[ctx.seq_dim] *= gather_group.size()
+            gathered_tensor = torch.empty(*gathered_tensor_size,
+                                          dtype=input.dtype,
+                                          device=input.device)
+            torch.distributed.all_gather_into_tensor(gathered_tensor, input, gather_group)
+
+            input = gathered_tensor
+
+        # if ctx.output_seq_shard, allgather here
+        if ctx.output_seq_shard:
+            gather_mesh_dim = 1 - backward_allreduce_mesh_dim
+            gather_group = mesh.get_dim_groups()[gather_mesh_dim]
+            gathered_tensor_size = list(grad_output.size())
+            gathered_tensor_size[ctx.seq_dim] *= gather_group.size()
+            gathered_tensor = torch.empty(*gathered_tensor_size,
+                                          dtype=grad_output.dtype,
+                                          device=grad_output.device)
+            torch.distributed.all_gather_into_tensor(gathered_tensor, grad_output, gather_group)
+
+            grad_output = gathered_tensor
+
         grad_output = grad_output.view(-1, grad_output.size()[-1])
         input_2d = input.view(-1, input.size()[-1])
 
         # async allreduce for grad_input
         grad_input = torch.ops.aten.mm(grad_output, weight)
-        handle = torch.distributed.all_reduce(grad_input,
-                                              dist.ReduceOp.SUM,
-                                              mesh.get_dim_groups()[backward_allreduce_mesh_dim],
-                                              async_op=True)
+        grad_input = grad_input.view(*(input.size()))
+
+        # local scatter grad_input
+        handle = None
+        reduce_group = mesh.get_dim_groups()[backward_allreduce_mesh_dim]
+        if ctx.input_seq_shard:
+            reduce_scatter_size = list(grad_input.size())
+            reduce_scatter_size[ctx.seq_dim] //= reduce_group.size()
+            reduce_scatter_output = torch.empty(*reduce_scatter_size,
+                                                device=grad_input.device,
+                                                dtype=grad_input.dtype)
+            handle = torch.distributed.reduce_scatter_tensor(reduce_scatter_output,
+                                                             grad_input,
+                                                             op=dist.ReduceOp.SUM,
+                                                             group=reduce_group)
+            grad_input = reduce_scatter_output
+        else:
+            handle = torch.distributed.all_reduce(grad_input,
+                                                  op=dist.ReduceOp.SUM,
+                                                  group=reduce_group,
+                                                  async_op=True)
+        delay_kernel(grad_output.device)
 
         grad_weight = torch.ops.aten.mm(grad_output.t(), input_2d)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
         # sync grad_input here
-        handle.wait()
-        grad_input = grad_input.view(*(input.size()))
+        if handle is not None:
+            handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None
 
 
 class TLLinear(torch.nn.Module):
@@ -82,7 +158,8 @@ class TLLinear(torch.nn.Module):
                  module_mesh: DeviceMesh,
                  shard_strategy: List[Placement],
                  input_is_shard: bool = False,
-                 shard_activation: bool = False,
+                 input_seq_shard: bool = False,
+                 output_seq_shard: bool = False,
                  skip_bias_add: bool = False,
                  params_dtype=torch.float32) -> None:
         super().__init__()
@@ -98,8 +175,14 @@ class TLLinear(torch.nn.Module):
         self.shard_input_size = self.input_size
         self.shard_output_size = self.output_size
 
+        self.input_seq_shard = input_seq_shard
+        self.output_seq_shard = output_seq_shard
+
         self.input_is_shard = input_is_shard
-        self.shard_activation = shard_activation
+        if self.input_seq_shard:
+            print(
+                "[TLLinear] warning set self.input_is_shard=True because self.input_seq_shard=True")
+            self.input_is_shard = True
 
         self.skip_bias_add = skip_bias_add
 
@@ -133,21 +216,30 @@ class TLLinear(torch.nn.Module):
         self.linear_func = TLLinearFunc.apply
 
     def forward(self, input_):
+        if self.input_seq_shard:
+            assert len(input_.size()) > 2, "input_ must has sequence dimension"
         bias = self.bias if not self.skip_bias_add else None
 
         if not self.input_is_shard:
             input_ = shard_to_tp_region(input_, self.mesh, self.shard_strategy)
-        output = self.linear_func(input_, self.weight, bias, self.mesh,
-                                  self.forward_allreduce_mesh_dim, self.backward_allreduce_mesh_dim)
+        output = self.linear_func(input_, self.weight, bias, self.mesh, self.input_seq_shard,
+                                  self.output_seq_shard, self.forward_allreduce_mesh_dim,
+                                  self.backward_allreduce_mesh_dim)
         return output
 
 
 class ColumnLinear(TLLinear):
+    """Linear layer with column parallelism.
+
+    The linear layer is defined as Y = XA + b. A is parallelized along
+    its second dimension as A = [A_1, ..., A_p].
+    """
 
     def __init__(self,
                  input_size: int,
                  output_size: int,
                  module_mesh: DeviceMesh,
+                 seq_shard: bool = False,
                  params_dtype=torch.float32) -> None:
 
         assert module_mesh.ndim == 2, "still need 2d device mesh for megatron-style TP"
@@ -163,16 +255,31 @@ class ColumnLinear(TLLinear):
                          output_size,
                          module_mesh,
                          shard_strategy,
-                         input_is_shard=True,
+                         input_is_shard=False,
+                         input_seq_shard=seq_shard,
+                         output_seq_shard=(not seq_shard),
                          params_dtype=params_dtype)
 
 
 class RowLinear(TLLinear):
+    """Linear layer with row parallelism.
+
+    The linear layer is defined as Y = XA + b. A is parallelized along
+    its first dimension and X along its second dimension as:
+               -   -
+              | A_1 |
+              | .   |
+          A = | .   |        X = [X_1, ..., X_p]
+              | .   |
+              | A_p |
+               -   -
+    """
 
     def __init__(self,
                  input_size: int,
                  output_size: int,
                  module_mesh: DeviceMesh,
+                 seq_shard: bool = False,
                  input_is_shard: bool = False,
                  params_dtype=torch.float32) -> None:
 
@@ -190,4 +297,6 @@ class RowLinear(TLLinear):
                          module_mesh,
                          shard_strategy,
                          input_is_shard=input_is_shard,
+                         input_seq_shard=(not seq_shard),
+                         output_seq_shard=seq_shard,
                          params_dtype=params_dtype)
