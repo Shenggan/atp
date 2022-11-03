@@ -72,32 +72,35 @@ class TLLinearFunc(torch.autograd.Function):
         if ctx.input_seq_shard:
             gather_mesh_dim = backward_allreduce_mesh_dim
             gather_group = mesh.get_dim_groups()[gather_mesh_dim]
-            input, handle = gather_tensor(input,
-                                          tensor_dim=ctx.seq_dim,
-                                          group=gather_group,
-                                          async_op=True)
+            input_not_ready, handle, post_func = gather_tensor(input,
+                                                               tensor_dim=ctx.seq_dim,
+                                                               group=gather_group,
+                                                               async_op=True)
             delay_kernel(grad_output.device)
 
         # async allreduce for grad_input
         grad_input = torch.ops.aten.mm(grad_output, weight)
-        grad_input = grad_input.view(*(input.size()))
 
         if handle:
             handle.wait()
+            input = post_func(input_not_ready)
             handle = None
+
+        grad_input = grad_input.view(*(input.size()))
 
         # local scatter grad_input
         reduce_group = mesh.get_dim_groups()[backward_allreduce_mesh_dim]
         if ctx.input_seq_shard:
-            grad_input, handle = reduce_scatter_tensor(grad_input,
-                                                       tensor_dim=ctx.seq_dim,
-                                                       group=reduce_group,
-                                                       async_op=True)
+            grad_input, handle, post_func = reduce_scatter_tensor(grad_input,
+                                                                  tensor_dim=ctx.seq_dim,
+                                                                  group=reduce_group,
+                                                                  async_op=True)
         else:
             handle = dist.all_reduce(grad_input,
                                      op=dist.ReduceOp.SUM,
                                      group=reduce_group,
                                      async_op=True)
+            post_func = lambda x: x
         delay_kernel(grad_output.device)
 
         input_2d = input.view(-1, input.size()[-1])
@@ -107,6 +110,7 @@ class TLLinearFunc(torch.autograd.Function):
         # sync grad_input here
         if handle is not None:
             handle.wait()
+            grad_input = post_func(grad_input)
 
         return grad_input, grad_weight, grad_bias, None, None, None, None, None
 

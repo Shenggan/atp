@@ -31,13 +31,15 @@ def gather_tensor(input_: torch.Tensor, tensor_dim: int, group: dist.ProcessGrou
     gather_tensor = torch.empty(*input_size, dtype=input_.dtype, device=input_.device)
     handle = dist.all_gather_into_tensor(gather_tensor, input_, group=group, async_op=async_op)
 
+    post_func = lambda x: x
+
     if tensor_dim != 0:
-        gather_tensor = gather_tensor.transpose(tensor_dim, 0).contiguous()
+        post_func = lambda x: x.transpose(tensor_dim, 0).contiguous()
 
     if async_op:
-        return gather_tensor, handle
+        return gather_tensor, handle, post_func
 
-    return gather_tensor
+    return post_func(gather_tensor)
 
 
 def reduce_scatter_tensor(input_: torch.Tensor,
@@ -55,13 +57,15 @@ def reduce_scatter_tensor(input_: torch.Tensor,
     scatter_tensor = torch.empty(*input_size, dtype=input_.dtype, device=input_.device)
     handle = dist.reduce_scatter_tensor(scatter_tensor, input_, group=group, async_op=async_op)
 
+    post_func = lambda x: x
+
     if tensor_dim != 0:
-        scatter_tensor = scatter_tensor.transpose(tensor_dim, 0).contiguous()
+        post_func = lambda x: x.transpose(tensor_dim, 0).contiguous()
 
     if async_op:
-        return scatter_tensor, handle
+        return scatter_tensor, handle, post_func
 
-    return scatter_tensor
+    return post_func(scatter_tensor)
 
 
 class _ShardToTPRegion(torch.autograd.Function):
