@@ -1,3 +1,3 @@
-from .fake_comm_kernel import FakeCommKernel
+from .dist_launch import lonestar6_launch
 
-__all__ = ['FakeCommKernel']
+__all__ = ['lonestar6_launch']
