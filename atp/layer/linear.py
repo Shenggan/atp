@@ -11,7 +11,7 @@ from .mapping import shard_to_tp_region, gather_tensor, reduce_scatter_tensor
 from .utils import delay_kernel
 
 
-class TLLinearFunc(torch.autograd.Function):
+class ATPLinearFunc(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
@@ -132,7 +132,7 @@ class TLLinearFunc(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None
 
 
-class TLLinear(torch.nn.Module):
+class ATPLinear(torch.nn.Module):
     """Linear Layer with Two Level Tensor Parallelism
 
     # X (shard(1), replicate), W (shard(0), shard(1)) -> Z (replicate, shard(1))
@@ -182,7 +182,7 @@ class TLLinear(torch.nn.Module):
         self.input_is_shard = input_is_shard
         if self.input_seq_shard:
             print(
-                "[TLLinear] warning set self.input_is_shard=True because self.input_seq_shard=True")
+                "[ATPLinear] warning set self.input_is_shard=True because self.input_seq_shard=True")
             self.input_is_shard = True
 
         self.skip_bias_add = skip_bias_add
@@ -219,7 +219,7 @@ class TLLinear(torch.nn.Module):
                         device=torch.cuda.current_device(),
                         dtype=self.params_dtype))
 
-        self.linear_func = TLLinearFunc.apply
+        self.linear_func = ATPLinearFunc.apply
 
     def forward(self, input_):
         if self.input_seq_shard:
@@ -235,7 +235,7 @@ class TLLinear(torch.nn.Module):
         return output
 
 
-class ColumnLinear(TLLinear):
+class ColumnLinear(ATPLinear):
     """Linear layer with column parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -268,7 +268,7 @@ class ColumnLinear(TLLinear):
                          params_dtype=params_dtype)
 
 
-class RowLinear(TLLinear):
+class RowLinear(ATPLinear):
     """Linear layer with row parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along

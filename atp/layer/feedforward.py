@@ -2,8 +2,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from spmd import Shard
 
-from tltp.layer import ColumnLinear, RowLinear, TLLinear
-from tltp.distributed import get_default_mesh
+from atp.layer import ColumnLinear, RowLinear, ATPLinear
+from atp.distributed import get_default_mesh
 
 
 class FeedForward(nn.Module):
@@ -37,7 +37,7 @@ class FeedForward(nn.Module):
         return output
 
 
-class TLFeedForward(nn.Module):
+class ATPFeedForward(nn.Module):
 
     def __init__(self, hidden_size, ratio=4, seq_shard=False, module_mesh=None) -> None:
         super().__init__()
@@ -52,14 +52,14 @@ class TLFeedForward(nn.Module):
         shard_strategy_1 = [Shard(1), Shard(0)]
         shard_strategy_2 = [Shard(0), Shard(1)]
 
-        self.dense_h_to_4h = TLLinear(self.hidden_size,
+        self.dense_h_to_4h = ATPLinear(self.hidden_size,
                                       self.ffn_hidden_size,
                                       self.module_mesh,
                                       shard_strategy=shard_strategy_1,
                                       input_is_shard=True,
                                       input_seq_shard=seq_shard,
                                       output_seq_shard=False)
-        self.dense_4h_to_h = TLLinear(self.ffn_hidden_size,
+        self.dense_4h_to_h = ATPLinear(self.ffn_hidden_size,
                                       self.hidden_size,
                                       self.module_mesh,
                                       shard_strategy=shard_strategy_2,

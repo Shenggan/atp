@@ -5,8 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from spmd import Shard, DeviceMesh
 
-from tltp.layer import TLLinear
-from tltp.distributed import get_default_mesh
+from atp.layer import ATPLinear
+from atp.distributed import get_default_mesh
 
 
 class AttentionCore(nn.Module):
@@ -49,7 +49,7 @@ class AttentionCore(nn.Module):
         return x
 
 
-class TLSelfAttention(nn.Module):
+class ATPSelfAttention(nn.Module):
 
     def __init__(self,
                  dim: int,
@@ -72,7 +72,7 @@ class TLSelfAttention(nn.Module):
         shard_strategy_2 = [Shard(0), Shard(1)]
 
         self.attention_head_size = dim // num_heads
-        self.query_key_value = TLLinear(dim,
+        self.query_key_value = ATPLinear(dim,
                                         3 * dim,
                                         self.module_mesh,
                                         shard_strategy=shard_strategy_1,
@@ -82,7 +82,7 @@ class TLSelfAttention(nn.Module):
                                         output_hidden_shard=True,
                                         params_dtype=dtype)
 
-        self.dense = TLLinear(dim,
+        self.dense = ATPLinear(dim,
                               dim,
                               self.module_mesh,
                               shard_strategy=shard_strategy_2,

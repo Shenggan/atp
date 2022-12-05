@@ -2,22 +2,22 @@ import torch
 import torch.distributed as dist
 from spmd import Shard
 
-from tltp.layer.feedforward import FeedForward, TLFeedForward
-import tltp.distributed as tltp_dist
+from atp.layer.feedforward import FeedForward, ATPFeedForward
+import atp.distributed as atp_dist
 
 
 def main():
     dist.init_process_group("nccl")
     world_size = dist.get_world_size()
-    tltp_dist.init_mesh((world_size, 1))
+    atp_dist.init_mesh((world_size, 1))
 
-    mesh = tltp_dist.get_default_mesh()
+    mesh = atp_dist.get_default_mesh()
 
     hidden_dim = 4096
 
     seq_shard = True
 
-    ff_module = TLFeedForward(hidden_dim, seq_shard=seq_shard).cuda().to(dtype=torch.float16)
+    ff_module = ATPFeedForward(hidden_dim, seq_shard=seq_shard).cuda().to(dtype=torch.float16)
 
     input_ = torch.randn(4, 1024 // mesh.get_dim_groups()[0].size(),
                          hidden_dim // mesh.get_dim_groups()[1].size()).to(

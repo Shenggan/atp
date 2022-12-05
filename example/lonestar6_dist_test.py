@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 import oneccl_bindings_for_pytorch
 
-from tltp.utils import lonestar6_launch
+from atp.utils import lonestar6_launch
 
 prof = torch.profiler.profile(
     schedule=torch.profiler.schedule(wait=1, warmup=3, active=6, repeat=1),

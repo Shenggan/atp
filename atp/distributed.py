@@ -12,8 +12,8 @@ from spmd import DeviceMesh
 
 
 class GroupMember(object):
-    ALL_TLTP_MESH: Optional[List[DeviceMesh]] = None
-    TLTP_MESH: Optional[DeviceMesh] = None
+    ALL_ATP_MESH: Optional[List[DeviceMesh]] = None
+    ATP_MESH: Optional[DeviceMesh] = None
 
 
 def init_mesh(mesh_info, device_type="cuda"):
@@ -35,12 +35,12 @@ def init_mesh(mesh_info, device_type="cuda"):
     # Sub Mesh also need to create mesh on every rank.
     for dp_rank_ in range(dp_size):
         mesh_device_id = (np.array(range(mesh_size)) + (dp_rank_ * mesh_size)).reshape(mesh_info)
-        if GroupMember.ALL_TLTP_MESH is None:
-            GroupMember.ALL_TLTP_MESH = []
-        GroupMember.ALL_TLTP_MESH.append(DeviceMesh(device_type, mesh_device_id))
+        if GroupMember.ALL_ATP_MESH is None:
+            GroupMember.ALL_ATP_MESH = []
+        GroupMember.ALL_ATP_MESH.append(DeviceMesh(device_type, mesh_device_id))
 
-    GroupMember.TLTP_MESH = GroupMember.ALL_TLTP_MESH[dp_rank]
+    GroupMember.ATP_MESH = GroupMember.ALL_ATP_MESH[dp_rank]
 
 
 def get_default_mesh():
-    return GroupMember.TLTP_MESH
+    return GroupMember.ATP_MESH

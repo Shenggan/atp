@@ -1,22 +1,22 @@
 import torch
 import torch.distributed as dist
 
-from tltp.layer.attention import TLSelfAttention
-import tltp.distributed as tltp_dist
+from atp.layer.attention import ATPSelfAttention
+import atp.distributed as atp_dist
 
 
 def main():
     dist.init_process_group("nccl")
     world_size = dist.get_world_size()
-    tltp_dist.init_mesh((world_size // 2, 2))
+    atp_dist.init_mesh((world_size // 2, 2))
 
-    mesh = tltp_dist.get_default_mesh()
+    mesh = atp_dist.get_default_mesh()
 
     hidden_dim = 8192
 
     seq_shard = True
 
-    att_module = TLSelfAttention(hidden_dim, 16, 0.1, 0.1,
+    att_module = ATPSelfAttention(hidden_dim, 16, 0.1, 0.1,
                                  seq_shard=seq_shard).cuda().to(dtype=torch.float16)
 
     input_ = torch.randn(4, 1024 // mesh.get_dim_groups()[0].size(),
@@ -36,7 +36,7 @@ def main():
 
     prof = torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=1, warmup=3, active=6, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/tl-att-fp16'),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(f'./log/atp-att-fp16'),
         record_shapes=False,
         with_stack=False)
 
