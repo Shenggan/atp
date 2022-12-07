@@ -42,6 +42,8 @@ class FakeCommKernel(object):
         # warm up triton kernel
         self.__warm_up()
 
+        self.comm_stream = torch.cuda.Stream()
+
     def print_summary(self):
         print(f"[FakeCommKernel]: ")
         print(f"  self.clock_rate = {self.clock_rate} ( in us )")
@@ -59,8 +61,22 @@ class FakeCommKernel(object):
         time_in_us = time_in_us * self.overhead_ratio_ - self.overhead_const_
         return time_in_us * self.clock_rate
 
-    def sleep(self, sleep_in_us):
+    def sleep(self, sleep_in_us, async_op=False):
         self.__prep_sleep()
-        self.kernel[self.kernel_grid](self.__calculate_clock(sleep_in_us),
-                                      self.start_clock_pointer,
-                                      BLOCK_SIZE=self.kernel_block_size)
+
+        if async_op is False:
+            self.kernel[self.kernel_grid](self.__calculate_clock(sleep_in_us),
+                                          self.start_clock_pointer,
+                                          BLOCK_SIZE=self.kernel_block_size)
+        else:
+            evt_1 = torch.cuda.current_stream().record_event()
+            with torch.cuda.stream(self.comm_stream):
+                self.comm_stream.wait_event(evt_1)
+                self.kernel[self.kernel_grid](self.__calculate_clock(sleep_in_us),
+                                              self.start_clock_pointer,
+                                              BLOCK_SIZE=self.kernel_block_size)
+
+                evt_2 = self.comm_stream.record_event()
+            
+            # torch.cuda.current_stream().wait_event(evt_2) will sync comm
+            return evt_2

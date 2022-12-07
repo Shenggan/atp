@@ -2,7 +2,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from spmd import Shard, DeviceMesh
 
 from atp.layer import ATPLinear
@@ -13,8 +12,7 @@ class AttentionCore(nn.Module):
 
     def __init__(self,
                  attention_head_size: int,
-                 attention_dropout: float,
-                 dtype: torch.dtype = None) -> None:
+                 attention_dropout: float) -> None:
         super().__init__()
         self.attention_head_size = attention_head_size
         self.attention_dropout = nn.Dropout(attention_dropout)
@@ -23,7 +21,7 @@ class AttentionCore(nn.Module):
 
         # (avoid the const tensor init when forward)
         self.causal_mask = None
-        self.where_const = torch.tensor(-1e4, device="cuda", dtype=dtype)
+        self.where_const = -1e4
 
     def forward(self, q, k, v, attention_mask):
         x = torch.matmul(q, k.transpose(-1, -2))
@@ -94,7 +92,7 @@ class ATPSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        self.core_attention = AttentionCore(self.attention_head_size, attention_dropout, dtype)
+        self.core_attention = AttentionCore(self.attention_head_size, attention_dropout)
 
     def forward(self, x, attention_mask=None):
 

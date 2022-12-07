@@ -1,5 +1,5 @@
 import torch
-from atp.utils import FakeCommKernel
+from atp.estimator import FakeCommKernel
 
 PROFILE = False
 PROFILE_WAIR = 1
