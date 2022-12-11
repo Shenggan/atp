@@ -11,10 +11,13 @@ from functorch._src.named_members_polyfill import (_named_buffers, _named_parame
 import atp.distributed as atp_dist
 from atp.layer.mapping import gather_tensor
 
-CHUNK = 3
+CHUNK = 1
 
 SEQ_PARA = True
 
+BWD_ASYNC = True
+
+torch.backends.cuda.matmul.allow_tf32 = True
 
 def _scatter_tensor(tensor: torch.Tensor, dim, pg):
     local_tensor = tensor.chunk(dist.get_world_size(pg), dim)[dist.get_rank(pg)]
@@ -45,7 +48,10 @@ def aten_linear_backward(output_grad, weight_t, input_2d, reduce_group=None):
     grad_input = mm.view(*(output_grad.size()[:-1]), -1)
     work = None
     if reduce_group:
-        work = dist.all_reduce(grad_input, op=dist.ReduceOp.SUM, group=reduce_group, async_op=True)
+        work = dist.all_reduce(grad_input,
+                               op=dist.ReduceOp.SUM,
+                               group=reduce_group,
+                               async_op=BWD_ASYNC)
     t_5 = torch.ops.aten.t.default(output_grad_2d)
     mm_1 = torch.ops.aten.mm.default(t_5, input_2d)
     t_6 = torch.ops.aten.t.default(mm_1)
@@ -192,9 +198,17 @@ def aten_transformer_layer_forward(primals_1, primals_2, primals_3, primals_4, p
     chunk_tensors = [torch.chunk(t, CHUNK) for t in (view_4, _unsafe_view_5)]
     works = []
     for view_4_chunk, _unsafe_view_5_chunk in zip(*chunk_tensors):
-        view_4_chunk_2d = view_4_chunk.view(view_4_chunk.size(0) * view_4_chunk.size(1), view_4_chunk.size(2))
-        aten_linear_forward(weight=primals_5, bias=None, input_=_unsafe_view_5_chunk, output_buf=view_4_chunk_2d)
-        works.append(dist.all_reduce(view_4_chunk, op=dist.ReduceOp.SUM, group=mesh.get_dim_groups()[0], async_op=True))
+        view_4_chunk_2d = view_4_chunk.view(
+            view_4_chunk.size(0) * view_4_chunk.size(1), view_4_chunk.size(2))
+        aten_linear_forward(weight=primals_5,
+                            bias=None,
+                            input_=_unsafe_view_5_chunk,
+                            output_buf=view_4_chunk_2d)
+        works.append(
+            dist.all_reduce(view_4_chunk,
+                            op=dist.ReduceOp.SUM,
+                            group=mesh.get_dim_groups()[0],
+                            async_op=True))
 
     for work in works:
         work.wait()
@@ -231,9 +245,17 @@ def aten_transformer_layer_forward(primals_1, primals_2, primals_3, primals_4, p
     chunk_tensors = [torch.chunk(t, CHUNK) for t in (view_6, getitem_6)]
     works = []
     for view_6_chunk, getitem_6_chunk in zip(*chunk_tensors):
-        view_6_chunk_2d = view_6_chunk.view(view_6_chunk.size(0) * view_6_chunk.size(1), view_6_chunk.size(2))
-        aten_linear_forward(weight=primals_9, bias=None, input_=getitem_6_chunk, output_buf=view_6_chunk_2d)
-        works.append(dist.all_reduce(view_6_chunk, op=dist.ReduceOp.SUM, group=mesh.get_dim_groups()[1], async_op=True))
+        view_6_chunk_2d = view_6_chunk.view(
+            view_6_chunk.size(0) * view_6_chunk.size(1), view_6_chunk.size(2))
+        aten_linear_forward(weight=primals_9,
+                            bias=None,
+                            input_=getitem_6_chunk,
+                            output_buf=view_6_chunk_2d)
+        works.append(
+            dist.all_reduce(view_6_chunk,
+                            op=dist.ReduceOp.SUM,
+                            group=mesh.get_dim_groups()[1],
+                            async_op=True))
 
     for work in works:
         work.wait()
@@ -254,9 +276,17 @@ def aten_transformer_layer_forward(primals_1, primals_2, primals_3, primals_4, p
     chunk_tensors = [torch.chunk(t, CHUNK) for t in (view_8, gelu)]
     works = []
     for view_8_chunk, gelu_chunk in zip(*chunk_tensors):
-        view_8_chunk_2d = view_8_chunk.view(view_8_chunk.size(0) * view_8_chunk.size(1), view_8_chunk.size(2))
-        aten_linear_forward(weight=primals_11, bias=None, input_=gelu_chunk, output_buf=view_8_chunk_2d)
-        works.append(dist.all_reduce(view_8_chunk, op=dist.ReduceOp.SUM, group=mesh.get_dim_groups()[0], async_op=True))
+        view_8_chunk_2d = view_8_chunk.view(
+            view_8_chunk.size(0) * view_8_chunk.size(1), view_8_chunk.size(2))
+        aten_linear_forward(weight=primals_11,
+                            bias=None,
+                            input_=gelu_chunk,
+                            output_buf=view_8_chunk_2d)
+        works.append(
+            dist.all_reduce(view_8_chunk,
+                            op=dist.ReduceOp.SUM,
+                            group=mesh.get_dim_groups()[0],
+                            async_op=True))
 
     for work in works:
         work.wait()
@@ -537,30 +567,50 @@ class AtenTransformerLayer(nn.Module):
         return ATPTransformerLayerFunc.apply(*para_, input_tensor_, self.dim_per_head, *buf_)
 
 
+class AtenTransformer(nn.Module):
+
+    def __init__(self, dim, dim_per_head, seq_length, layer, mlp_ratio=4):
+        super(AtenTransformer, self).__init__()
+        self.layers = nn.ModuleList([
+            AtenTransformerLayer(dim=dim,
+                                 dim_per_head=dim_per_head,
+                                 seq_length=seq_length,
+                                 mlp_ratio=mlp_ratio) for _ in range(layer)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 def main():
 
-    parser = argparse.ArgumentParser(
-        description='ATen Transformer Implenmenattion for Megatron-LM TP')
+    parser = argparse.ArgumentParser(description='ATen Transformer Implenmenattion for Adaptive TP')
 
     parser.add_argument("--batch-size", default=4, type=int, help='batch size')
     parser.add_argument("--chunk-size", default=1, type=int, help='chunk size')
-    parser.add_argument("--seq-size", default=256, type=int, help='seq length')
-    parser.add_argument("--dim", default=2048, type=int, help='hidden dim size')
-    parser.add_argument("--heads", default=8, type=int, help='num of heads')
+    parser.add_argument("--seq-size", default=1024, type=int, help='seq length')
+    parser.add_argument("--dim", default=8192, type=int, help='hidden dim size')
+    parser.add_argument("--heads", default=32, type=int, help='num of heads')
+    parser.add_argument("--layer", default=10, type=int, help='num of heads')
 
     parser.add_argument("--sm-size", default=2, type=int, help='sub mesh size')
 
     parser.add_argument('--seq-para', action='store_true', help='use sequence parallelism.')
     parser.add_argument('--fp16', action='store_true', help='use half precision.')
     parser.add_argument('--cpu', action='store_true', help='run cpu version.')
+    parser.add_argument('--no-bwd-async', action='store_true', help='run cpu version.')
 
     args = parser.parse_args()
 
     global CHUNK
     global SEQ_PARA
+    global BWD_ASYNC
 
     CHUNK = args.chunk_size
     SEQ_PARA = args.seq_para
+    BWD_ASYNC = not args.no_bwd_async
 
     dist.init_process_group("nccl")
     world_size = dist.get_world_size()
@@ -575,20 +625,35 @@ def main():
 
     batch_, seq_, dim_ = args.batch_size, args.seq_size, args.dim
     dim_per_head = args.dim // args.heads
-    test_module = AtenTransformerLayer(dim=dim_, dim_per_head=dim_per_head,
-                                       seq_length=seq_).to(device=device, dtype=dtype)
+    test_module = AtenTransformer(dim=dim_,
+                                  dim_per_head=dim_per_head,
+                                  layer=args.layer,
+                                  seq_length=seq_).to(device=device, dtype=dtype)
 
     input_ = torch.ones(batch_, seq_, dim_).to(device=device, dtype=dtype)
     if SEQ_PARA:
-        input_ = torch.ones(batch_, seq_ // (mesh.size(0) * mesh.size(1)), dim_).to(device=device,
-                                                                                    dtype=dtype)
-    output_ = test_module(input_)
+        input_ = torch.ones(batch_, seq_ // mesh.size(0), dim_).to(device=device, dtype=dtype)
 
-    output_grad = torch.rand_like(output_)
+    output_grad = torch.rand_like(input_)
 
-    output_.backward(output_grad)
+    for _ in range(10):
+        fwd_start = torch.cuda.Event(enable_timing=True)
+        bwd_start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
 
-    print(output_.shape)
+        fwd_start.record()
+        output_ = test_module(input_)
+
+        bwd_start.record()
+        output_.backward(output_grad)
+        end.record()
+
+        dist.barrier()
+        torch.cuda.synchronize()
+        if dist.get_rank() == 0:
+            print(
+                f"Step Time: {fwd_start.elapsed_time(end)}; Fwd Time: {fwd_start.elapsed_time(bwd_start)}; Bwd Time: {bwd_start.elapsed_time(end)}"
+            )
 
     dist.barrier()
     dist.destroy_process_group(dist.group.WORLD)
