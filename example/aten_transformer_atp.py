@@ -17,7 +17,8 @@ SEQ_PARA = True
 
 BWD_ASYNC = True
 
-torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cuda.matmul.allow_tf32 = True
+
 
 def _scatter_tensor(tensor: torch.Tensor, dim, pg):
     local_tensor = tensor.chunk(dist.get_world_size(pg), dim)[dist.get_rank(pg)]
@@ -345,7 +346,7 @@ def aten_transformer_layer_backward(_reshape_alias, view, primals_2, view_7, pri
     _reshape_alias_2, t_7, view_9 = aten_linear_backward(tangents_1_gather,
                                                          t_3,
                                                          view_7,
-                                                         reduce_group=mesh.get_dim_groups()[0])
+                                                         reduce_group=mesh.get_dim_groups()[1])
     t_3 = view_7 = None
 
     gelu_backward = torch.ops.aten.gelu_backward.default(_reshape_alias_2, view_6)
@@ -355,7 +356,7 @@ def aten_transformer_layer_backward(_reshape_alias, view, primals_2, view_7, pri
     _reshape_alias_4, t_11, view_10 = aten_linear_backward(gelu_backward,
                                                            t_2,
                                                            view_5,
-                                                           reduce_group=mesh.get_dim_groups()[1])
+                                                           reduce_group=mesh.get_dim_groups()[0])
     gelu_backward = t_2 = view_5 = None
 
     _reshape_alias_4 = gather_tensor(_reshape_alias_4,
@@ -382,7 +383,7 @@ def aten_transformer_layer_backward(_reshape_alias, view, primals_2, view_7, pri
     _reshape_alias_6, t_15, view_11 = aten_linear_backward(add_2,
                                                            t_1,
                                                            view_3,
-                                                           reduce_group=mesh.get_dim_groups()[0])
+                                                           reduce_group=mesh.get_dim_groups()[1])
     add_2 = t_1 = view_3 = None
     _reshape_alias_6 = _scatter_tensor(_reshape_alias_6, dim=-1, pg=mesh.get_dim_groups()[1])
 
@@ -468,7 +469,7 @@ def aten_transformer_layer_backward(_reshape_alias, view, primals_2, view_7, pri
     _reshape_alias_14, t_19, view_12 = aten_linear_backward(_unsafe_view_7,
                                                             t,
                                                             view,
-                                                            reduce_group=mesh.get_dim_groups()[1])
+                                                            reduce_group=mesh.get_dim_groups()[0])
     _unsafe_view_7 = t = view = None
 
     _reshape_alias_14 = gather_tensor(_reshape_alias_14,
@@ -590,15 +591,16 @@ def main():
 
     parser.add_argument("--batch-size", default=4, type=int, help='batch size')
     parser.add_argument("--chunk-size", default=1, type=int, help='chunk size')
-    parser.add_argument("--seq-size", default=1024, type=int, help='seq length')
-    parser.add_argument("--dim", default=8192, type=int, help='hidden dim size')
-    parser.add_argument("--heads", default=32, type=int, help='num of heads')
-    parser.add_argument("--layer", default=10, type=int, help='num of heads')
+    parser.add_argument("--seq-size", default=2048, type=int, help='seq length')
+    parser.add_argument("--dim", default=12288, type=int, help='hidden dim size')
+    parser.add_argument("--heads", default=48, type=int, help='num of heads')
+    parser.add_argument("--layer", default=2, type=int, help='num of heads')
 
     parser.add_argument("--sm-size", default=2, type=int, help='sub mesh size')
 
     parser.add_argument('--seq-para', action='store_true', help='use sequence parallelism.')
     parser.add_argument('--fp16', action='store_true', help='use half precision.')
+    parser.add_argument('--prof', action='store_true', help='use half precision.')
     parser.add_argument('--cpu', action='store_true', help='run cpu version.')
     parser.add_argument('--no-bwd-async', action='store_true', help='run cpu version.')
 
@@ -623,6 +625,9 @@ def main():
 
     mesh = atp_dist.get_default_mesh()
 
+    if dist.get_rank() == 0:
+        print(args)
+
     batch_, seq_, dim_ = args.batch_size, args.seq_size, args.dim
     dim_per_head = args.dim // args.heads
     test_module = AtenTransformer(dim=dim_,
@@ -632,11 +637,25 @@ def main():
 
     input_ = torch.ones(batch_, seq_, dim_).to(device=device, dtype=dtype)
     if SEQ_PARA:
-        input_ = torch.ones(batch_, seq_ // mesh.size(0), dim_).to(device=device, dtype=dtype)
+        input_ = torch.ones(batch_, seq_ // (mesh.size(0) * mesh.size(1)), dim_).to(device=device,
+                                                                                    dtype=dtype)
 
     output_grad = torch.rand_like(input_)
 
-    for _ in range(10):
+    if args.prof:
+        prof = torch.profiler.profile(schedule=torch.profiler.schedule(wait=1,
+                                                                       warmup=2,
+                                                                       active=3,
+                                                                       repeat=1),
+                                      on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                                          f'./log/atp-{args.sm_size}-{args.chunk_size}/'),
+                                      profile_memory=False,
+                                      record_shapes=False,
+                                      with_stack=False)
+
+        prof.start()
+
+    for _ in range(6):
         fwd_start = torch.cuda.Event(enable_timing=True)
         bwd_start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -654,6 +673,12 @@ def main():
             print(
                 f"Step Time: {fwd_start.elapsed_time(end)}; Fwd Time: {fwd_start.elapsed_time(bwd_start)}; Bwd Time: {bwd_start.elapsed_time(end)}"
             )
+
+        if args.prof:
+            prof.step()
+
+    if args.prof:
+        prof.stop()
 
     dist.barrier()
     dist.destroy_process_group(dist.group.WORLD)

@@ -536,14 +536,15 @@ def main():
 
     parser.add_argument("--batch-size", default=4, type=int, help='batch size')
     parser.add_argument("--chunk-size", default=1, type=int, help='chunk size')
-    parser.add_argument("--seq-size", default=1024, type=int, help='seq length')
-    parser.add_argument("--dim", default=8192, type=int, help='hidden dim size')
-    parser.add_argument("--heads", default=32, type=int, help='num of heads')
-    parser.add_argument("--layer", default=10, type=int, help='num of heads')
+    parser.add_argument("--seq-size", default=2048, type=int, help='seq length')
+    parser.add_argument("--dim", default=12288, type=int, help='hidden dim size')
+    parser.add_argument("--heads", default=48, type=int, help='num of heads')
+    parser.add_argument("--layer", default=2, type=int, help='num of heads')
 
     parser.add_argument('--seq-para', action='store_true', help='use sequence parallelism.')
     parser.add_argument('--fp16', action='store_true', help='use half precision.')
     parser.add_argument('--cpu', action='store_true', help='run cpu version.')
+    parser.add_argument('--prof', action='store_true', help='run cpu version.')
     parser.add_argument('--no-bwd-async', action='store_true', help='run cpu version.')
 
     args = parser.parse_args()
@@ -583,7 +584,20 @@ def main():
 
     output_grad = torch.rand_like(input_)
 
-    for _ in range(10):
+    if args.prof:
+        prof = torch.profiler.profile(schedule=torch.profiler.schedule(wait=1,
+                                                                       warmup=2,
+                                                                       active=3,
+                                                                       repeat=1),
+                                      on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                                          f'./log/megatron--chunk-{args.chunk_size}/'),
+                                      profile_memory=False,
+                                      record_shapes=False,
+                                      with_stack=False)
+
+        prof.start()
+
+    for _ in range(6):
         fwd_start = torch.cuda.Event(enable_timing=True)
         bwd_start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -601,6 +615,11 @@ def main():
             print(
                 f"Step Time: {fwd_start.elapsed_time(end)}; Fwd Time: {fwd_start.elapsed_time(bwd_start)}; Bwd Time: {bwd_start.elapsed_time(end)}"
             )
+        if args.prof:
+            prof.step()
+
+    if args.prof:
+        prof.stop()
 
     dist.barrier()
     dist.destroy_process_group(dist.group.WORLD)
