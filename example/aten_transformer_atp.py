@@ -1,3 +1,4 @@
+import os
 import math
 import argparse
 
@@ -626,7 +627,11 @@ def main():
     mesh = atp_dist.get_default_mesh()
 
     if dist.get_rank() == 0:
-        print(args)
+        print(f">> {args}")
+        nccl_env = [i for i in list(os.environ.keys()) if i.startswith('NCCL')]
+        cuda_env = [i for i in list(os.environ.keys()) if i.startswith('CUDA')]
+        for env in nccl_env + cuda_env:
+            print(f">> {env}: {os.environ[env]}")
 
     batch_, seq_, dim_ = args.batch_size, args.seq_size, args.dim
     dim_per_head = args.dim // args.heads
